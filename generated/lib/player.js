@@ -9,8 +9,6 @@ var PLAYER_EVENT_TRIGGER_PLAY = "onPlayerTriggerPlay";
 var PLAYER_EVENT_TRIGGER_PAUSE = "onPlayerTriggerPause";
 var CLOSE_BUFFER_EVENT = "close_buffer";
 var ALL_SEGMENTS_LOADED_EVENT = "onAllSegmentsLoaded";
-var MEDIA_SOURCE_SHOULD_REINITIALIZE = "media_source_should_reinitialize";
-var MEDIA_SOURCE_REINITIALIZED = "media_source_reinitialized";
 
 function Player(video, options) {
   let instance;
@@ -57,9 +55,6 @@ function Player(video, options) {
     });
     video.addEventListener("playing", function (event) {
       video.autoplay = true;
-    });
-    _eventEmitter.on(MEDIA_SOURCE_SHOULD_REINITIALIZE, function () {
-      reinitializeMediaSource();
     });
     return new Promise((resolve) => {
       createMediaSource().then(function (mediaSource) {
@@ -253,9 +248,6 @@ function Player(video, options) {
       bufferManager.on(ALL_SEGMENTS_LOADED_EVENT, function () {
         closeStream();
       });
-      bufferManager.on(MEDIA_SOURCE_SHOULD_REINITIALIZE, function () {
-        _eventEmitter.dispatchEvent(MEDIA_SOURCE_SHOULD_REINITIALIZE);
-      });
       var promises = [];
       for (let manifest of manifests) {
         var bufferOffset = 0;
@@ -347,7 +339,6 @@ function Player(video, options) {
   }
 
   function createMediaSource() {
-    logger.debug("creating media source");
     return new Promise(function (resolve) {
       var mediaSource = new MediaSource();
       _video.src = URL.createObjectURL(mediaSource);
@@ -359,22 +350,6 @@ function Player(video, options) {
         resolve(mediaSource);
       };
       mediaSource.addEventListener("sourceopen", handleMediaSourceOpened);
-    });
-  }
-
-  function reinitializeMediaSource() {
-    logger.debug("reinitializing media source");
-    var currentTime = video.currentTime;
-    video.removeAttribute("src");
-    video.load();
-    createMediaSource().then(function (mediaSource) {
-      setCurrentTime(currentTime);
-      if (_videoBufferManager) {
-        _videoBufferManager.setMediaSource(mediaSource);
-      }
-      if (_audioBufferManager) {
-        _audioBufferManager.setMediaSource(mediaSource);
-      }
     });
   }
 
@@ -723,9 +698,9 @@ function BufferManager(manifests, mediaSource, video, options) {
     var bufferingSegment = _bufferingSegment;
     if (playingSegment < endSegment && bufferingSegment > startSegment) {
       if (playingSegment < startSegment) {
-        setBufferingSegment(startSegment);
+        _bufferingSegment = startSegment;
       } else {
-        setBufferingSegment(playingSegment);
+        _bufferingSegment = playingSegment;
       }
     }
 
@@ -864,7 +839,6 @@ function BufferManager(manifests, mediaSource, video, options) {
       _eventEmitter.dispatchEvent(ALL_SEGMENTS_LOADED_EVENT);
       return;
     }
-    logger.debug("next segment to buffer: " + segment.getNumber());
     bufferSegment(segment).then(function () {
       _isBufferingSegment = false;
       bufferVideo();
@@ -884,7 +858,7 @@ function BufferManager(manifests, mediaSource, video, options) {
 
   function getNextBufferSegment() {
     if (!_bufferingSegment && _bufferingSegment !== 0) {
-      setBufferingSegment(0);
+      _bufferingSegment = 0;
     }
     var segment = _segments[_bufferingSegment];
     if (_outOfOrderLoading && _loading) {
@@ -916,6 +890,24 @@ function BufferManager(manifests, mediaSource, video, options) {
         video.currentTime +
         ")"
     );
+
+    if (!_sourceBuffer) {
+      logger.debug("adding source buffer for mimeCodec: " + mimeCodec);
+      _sourceBuffer = _mediaSource.addSourceBuffer(mimeCodec);
+      _currentMimeCodec = mimeCodec;
+      if (_appendWindowBoundaries) {
+        for (var i = 0; i < _appendWindowBoundaries.length; i++) {
+          if (
+            _bufferingSegment <=
+            _appendWindowBoundaries[i].lastPlayoutEntry - 1
+          ) {
+            _currentAppendWindow = i;
+            setAppendWindow(_appendWindowBoundaries[i]);
+            break;
+          }
+        }
+      }
+    }
 
     return new Promise(function (resolve) {
       var fetchJobs = [];
@@ -1013,7 +1005,6 @@ function BufferManager(manifests, mediaSource, video, options) {
     }
     return new Promise(function (resolve) {
       bufferInfo.resolve = resolve;
-      logger.debug("queueing segment " + bufferInfo.segment.getNumber());
       _bufferQueue.push(bufferInfo);
       appendQueuedBuffers();
     });
@@ -1046,38 +1037,8 @@ function BufferManager(manifests, mediaSource, video, options) {
         );
         bufferInfo.resolve();
         appendQueuedBuffers();
-        setBufferingSegment(_bufferingSegment + 1);
+        _bufferingSegment++;
         return Promise.resolve();
-      }
-    }
-
-    var arrayBuffer = bufferInfo.arrayBuffer;
-    var representationNumber = bufferInfo.segment.getRepresentationNumber();
-    var periodNumber = bufferInfo.segment.getPeriodNumber();
-    var manifestIndex = bufferInfo.segment.getManifestIndex();
-
-    var representation = _manifests[manifestIndex].getRepresentation(
-      representationNumber,
-      periodNumber
-    );
-    var nextMimeCodec = representation.getMimeCodec();
-
-    if (!_sourceBuffer) {
-      var mimeCodec = nextMimeCodec;
-      logger.debug("adding source buffer for mimeCodec: " + mimeCodec);
-      _sourceBuffer = _mediaSource.addSourceBuffer(mimeCodec);
-      _currentMimeCodec = mimeCodec;
-      if (_appendWindowBoundaries) {
-        for (var i = 0; i < _appendWindowBoundaries.length; i++) {
-          if (
-            _bufferingSegment <=
-            _appendWindowBoundaries[i].lastPlayoutEntry - 1
-          ) {
-            _currentAppendWindow = i;
-            setAppendWindow(_appendWindowBoundaries[i]);
-            break;
-          }
-        }
       }
     }
 
@@ -1093,6 +1054,16 @@ function BufferManager(manifests, mediaSource, video, options) {
       }
     }
 
+    var arrayBuffer = bufferInfo.arrayBuffer;
+    var representationNumber = bufferInfo.segment.getRepresentationNumber();
+    var periodNumber = bufferInfo.segment.getPeriodNumber();
+    var manifestIndex = bufferInfo.segment.getManifestIndex();
+
+    var representation = _manifests[manifestIndex].getRepresentation(
+      representationNumber,
+      periodNumber
+    );
+    var nextMimeCodec = representation.getMimeCodec();
     var isCodecChange = nextMimeCodec !== _currentMimeCodec;
     if (!_useChangeType && isCodecChange) {
       _bufferQueue.unshift(bufferInfo);
@@ -1107,28 +1078,9 @@ function BufferManager(manifests, mediaSource, video, options) {
           " to " +
           nextMimeCodec
       );
-      logger.debug("next segment codec change detected, pausing buffering");
+      _registerMimeCodecChange(timestamp, nextMimeCodec);
       _isBuffering = false;
       _isBufferingSegment = false;
-      video.addEventListener("waiting", function handleBufferUnderrun() {
-        video.removeEventListener("waiting", handleBufferUnderrun);
-        logger.debug("initiating media source reinitialization");
-        _sourceBuffer = null;
-        _eventEmitter.dispatchEvent(MEDIA_SOURCE_SHOULD_REINITIALIZE);
-        _eventEmitter.on(
-          MEDIA_SOURCE_REINITIALIZED,
-          function handleMediaSourceReinitialized() {
-            _eventEmitter.off(handleMediaSourceReinitialized);
-            logger.debug("media source reinitialized, resuming buffering");
-            _eventEmitter.on("onSegmentLoaded", function handleSegmentLoaded() {
-              _eventEmitter.off(handleSegmentLoaded);
-              setBufferingSegment(bufferInfo.segment.getNumber() + 1);
-              startBuffering();
-            });
-            appendQueuedBuffers();
-          }
-        );
-      });
       return;
     }
 
@@ -1187,7 +1139,7 @@ function BufferManager(manifests, mediaSource, video, options) {
           !bufferInfo.chunkNumber ||
           (bufferInfo.chunkNumber && bufferInfo.lastChunk)
         ) {
-          setBufferingSegment(bufferInfo.segment.getNumber() + 1);
+          _bufferingSegment++;
         }
 
         _eventEmitter.dispatchEvent("onSegmentLoaded", {
@@ -1251,7 +1203,7 @@ function BufferManager(manifests, mediaSource, video, options) {
       break;
     }
 
-    if (bufferEdgeSegment) setBufferingSegment(bufferEdgeSegment.getNumber());
+    if (bufferEdgeSegment) _bufferingSegment = bufferEdgeSegment.getNumber();
   }
 
   function handleCurrentTimeChange(currentTime) {
@@ -1399,11 +1351,6 @@ function BufferManager(manifests, mediaSource, video, options) {
     _bufferTime = bufferTime;
   }
 
-  function setBufferingSegment(bufferingSegment) {
-    logger.debug("setting buffering segment to " + bufferingSegment);
-    _bufferingSegment = bufferingSegment;
-  }
-
   function getCurrentMimeCodec() {
     return _currentMimeCodec;
   }
@@ -1411,7 +1358,6 @@ function BufferManager(manifests, mediaSource, video, options) {
   function setMediaSource(mediaSource) {
     _mediaSource = mediaSource;
     _sourceBuffer = null;
-    _eventEmitter.dispatchEvent(MEDIA_SOURCE_REINITIALIZED);
   }
 
   function setMaxBackwardBuffer(maxBackwardBuffer) {
